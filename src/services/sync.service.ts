@@ -157,15 +157,16 @@ export class SyncService {
             });
           }
 
-          // Unlock encryption and sync from remote on startup
-          const unlocked = await this.useDefaultPassword();
-          if (unlocked) {
+          // Auto-sync can only run after the user unlocks encryption.
+          if (pluginConfig.autoSyncOnStartup && this.hasPassword()) {
             this.log.info('Auto-sync: pulling config from remote...');
             this.fullSync().catch((err) => {
               this.log.error('Auto-sync on startup failed:', err);
             });
           } else {
-            this.log.warn('Auto-sync skipped: failed to unlock master password');
+            this.log.info(
+              'Auto-sync on startup skipped until sync password is unlocked',
+            );
           }
         }
       } catch (error) {
@@ -174,9 +175,7 @@ export class SyncService {
     }
 
     // Start watching for config changes if enabled
-    if (pluginConfig.enabled && pluginConfig.autoSyncOnChange) {
-      this.startWatchingChanges();
-    }
+    this.refreshChangeWatcher();
   }
 
   /**
@@ -187,6 +186,11 @@ export class SyncService {
    * @returns True if password is correct (or first-time setup)
    */
   setMasterPassword(password: string): boolean {
+    if (!password) {
+      this.log.warn('Empty master password rejected');
+      return false;
+    }
+
     const pluginConfig = this.getPluginConfig();
 
     // If we have a stored hash, verify password
@@ -204,6 +208,8 @@ export class SyncService {
     }
 
     this.masterPassword = password;
+    this.crypto.clearCache();
+    this.refreshChangeWatcher();
     this.log.info('Master password set successfully');
     return true;
   }
@@ -214,6 +220,10 @@ export class SyncService {
    * @param password - New master password
    */
   async setupMasterPassword(password: string): Promise<void> {
+    if (!password) {
+      throw new Error('Master password cannot be empty');
+    }
+
     const { hash, salt } = this.crypto.generatePasswordHash(password);
 
     await this.savePluginConfig({
@@ -222,7 +232,100 @@ export class SyncService {
     });
 
     this.masterPassword = password;
+    this.crypto.clearCache();
+    this.refreshChangeWatcher();
     this.log.info('Master password configured');
+  }
+
+  /**
+   * Configures the master password for first-time setup.
+   * If Drive is connected, validates it against the remote file before storing
+   * the local verification hash. This avoids pinning a new machine to a wrong
+   * password when an encrypted sync file already exists.
+   */
+  async configureMasterPassword(password: string): Promise<SyncResult | null> {
+    if (!password) {
+      return {
+        success: false,
+        action: 'none',
+        timestamp: Date.now(),
+        error: 'Master password cannot be empty',
+      };
+    }
+
+    if (this.isPasswordConfigured()) {
+      const unlocked = this.setMasterPassword(password);
+      if (!unlocked) {
+        return {
+          success: false,
+          action: 'none',
+          timestamp: Date.now(),
+          error: 'Incorrect master password',
+        };
+      }
+      return null;
+    }
+
+    this.masterPassword = password;
+    this.crypto.clearCache();
+
+    if (this.drive.isConnected()) {
+      const syncResult = await this.fullSync();
+      if (!syncResult.success) {
+        this.clearPassword();
+        return syncResult;
+      }
+    }
+
+    await this.setupMasterPassword(password);
+    return null;
+  }
+
+  /**
+   * Changes the local master password and re-encrypts the remote sync file.
+   */
+  async changeMasterPassword(password: string): Promise<SyncResult | null> {
+    if (!password) {
+      return {
+        success: false,
+        action: 'none',
+        timestamp: Date.now(),
+        error: 'Master password cannot be empty',
+      };
+    }
+
+    if (!this.masterPassword) {
+      return {
+        success: false,
+        action: 'none',
+        timestamp: Date.now(),
+        error: 'Unlock the current master password before changing it',
+      };
+    }
+
+    if (!this.drive.isConnected()) {
+      return {
+        success: false,
+        action: 'none',
+        timestamp: Date.now(),
+        error: 'Connect Google Drive before changing the master password',
+      };
+    }
+
+    const previousPassword = this.masterPassword;
+    this.masterPassword = password;
+    this.crypto.clearCache();
+
+    const syncResult = await this.syncToRemote();
+    if (!syncResult.success) {
+      this.masterPassword = previousPassword;
+      this.crypto.clearCache();
+      this.refreshChangeWatcher();
+      return syncResult;
+    }
+
+    await this.setupMasterPassword(password);
+    return syncResult;
   }
 
   /**
@@ -248,21 +351,8 @@ export class SyncService {
   clearPassword(): void {
     this.masterPassword = null;
     this.crypto.clearCache();
+    this.refreshChangeWatcher();
     this.log.debug('Master password cleared');
-  }
-
-  /**
-   * Automatically configures/unlocks with default password '123456'.
-   */
-  async useDefaultPassword(): Promise<boolean> {
-    const DEFAULT_PASS = '123456';
-
-    if (!this.isPasswordConfigured()) {
-      await this.setupMasterPassword(DEFAULT_PASS);
-      return true;
-    } else {
-      return this.setMasterPassword(DEFAULT_PASS);
-    }
   }
 
   /**
@@ -285,6 +375,7 @@ export class SyncService {
         googleAuthTokens: tokens as GDriveSyncConfig['googleAuthTokens'],
       });
 
+      this.refreshChangeWatcher();
       this.log.info('Google Drive connected');
       return true;
     } catch (error) {
@@ -298,10 +389,12 @@ export class SyncService {
    */
   async disconnectGoogleDrive(): Promise<void> {
     await this.drive.disconnect();
+    this.clearPassword();
     await this.savePluginConfig({
       googleAuthTokens: undefined,
       driveFileId: undefined,
     });
+    this.refreshChangeWatcher();
     this.log.info('Google Drive disconnected');
   }
 
@@ -318,11 +411,7 @@ export class SyncService {
   async setEnabled(enabled: boolean): Promise<void> {
     await this.savePluginConfig({ enabled });
 
-    if (enabled && this.getPluginConfig().autoSyncOnChange) {
-      this.startWatchingChanges();
-    } else {
-      this.stopWatchingChanges();
-    }
+    this.refreshChangeWatcher();
 
     this.updateSyncState({
       status: enabled ? 'idle' : 'disabled',
@@ -349,11 +438,34 @@ export class SyncService {
       .subscribe(() => {
         this.zone.run(() => {
           this.updateSyncState({ pendingChanges: true });
+          if (!this.masterPassword) {
+            this.log.debug('Auto-sync skipped: master password is locked');
+            return;
+          }
           this.syncToRemote().catch((error) => {
             this.log.error('Auto-sync failed:', error);
           });
         });
       });
+  }
+
+  /**
+   * Starts or stops config-change watching based on connection and password state.
+   */
+  private refreshChangeWatcher(): void {
+    const pluginConfig = this.getPluginConfig();
+    const shouldWatch = !!(
+      pluginConfig.enabled &&
+      pluginConfig.autoSyncOnChange &&
+      this.masterPassword &&
+      this.drive.isConnected()
+    );
+
+    if (shouldWatch) {
+      this.startWatchingChanges();
+    } else {
+      this.stopWatchingChanges();
+    }
   }
 
   /**

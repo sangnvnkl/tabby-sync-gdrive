@@ -92,14 +92,133 @@ import { SyncVersion } from '../interfaces/sync.interface';
         </div>
       </div>
 
+      <!-- Sync Password -->
+      <div class="password-section" *ngIf="driveStatus?.connected">
+        <h4>
+          <i class="fas fa-key"></i>
+          Sync Password
+        </h4>
+
+        <div class="password-ok" *ngIf="passwordUnlocked && !isChangingPassword">
+          <i class="fas fa-lock-open"></i>
+          Encryption unlocked
+        </div>
+
+        <div class="help-text" *ngIf="!passwordConfigured">
+          Create a master password before the first sync. Use the same password
+          on every machine.
+        </div>
+        <div
+          class="help-text"
+          *ngIf="passwordConfigured && !passwordUnlocked && !isChangingPassword"
+        >
+          Enter the master password used for this Google Drive sync file.
+        </div>
+        <div class="help-text" *ngIf="isChangingPassword">
+          Choose a new master password. The remote sync file will be
+          re-encrypted.
+        </div>
+
+        <div *ngIf="!passwordUnlocked || isChangingPassword">
+          <div class="password-input-row">
+            <input
+              class="form-control"
+              type="password"
+              [(ngModel)]="passwordInput"
+              [attr.autocomplete]="
+                passwordConfigured && !isChangingPassword
+                  ? 'current-password'
+                  : 'new-password'
+              "
+              [placeholder]="
+                passwordConfigured && !isChangingPassword
+                  ? 'Master password'
+                  : 'New master password'
+              "
+              (keyup.enter)="saveOrUnlockPassword()"
+            />
+          </div>
+
+          <div class="password-input-row" *ngIf="needsPasswordConfirmation">
+            <input
+              class="form-control"
+              type="password"
+              [(ngModel)]="passwordConfirm"
+              autocomplete="new-password"
+              placeholder="Confirm password"
+              (keyup.enter)="saveOrUnlockPassword()"
+            />
+          </div>
+
+          <div class="password-actions">
+            <button
+              class="btn btn-primary"
+              (click)="saveOrUnlockPassword()"
+              [disabled]="isSavingPassword"
+            >
+              <i class="fas fa-lock"></i>
+              {{ isSavingPassword ? 'Saving...' : passwordActionLabel }}
+            </button>
+            <button
+              *ngIf="isChangingPassword"
+              class="btn btn-secondary"
+              (click)="cancelPasswordChange()"
+              [disabled]="isSavingPassword"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+
+        <div
+          class="password-actions"
+          *ngIf="passwordUnlocked && !isChangingPassword"
+        >
+          <button
+            class="btn btn-success"
+            (click)="syncNow()"
+            [disabled]="isSyncingNow"
+          >
+            <i class="fas fa-sync" [class.fa-spin]="isSyncingNow"></i>
+            {{ isSyncingNow ? 'Syncing...' : 'Sync Now' }}
+          </button>
+          <button class="btn btn-secondary" (click)="lockPassword()">
+            <i class="fas fa-lock"></i>
+            Lock
+          </button>
+          <button class="btn btn-warning" (click)="beginPasswordChange()">
+            <i class="fas fa-key"></i>
+            Change Password
+          </button>
+        </div>
+
+        <div class="password-error" *ngIf="passwordError">
+          {{ passwordError }}
+        </div>
+        <div class="password-ok mt-2" *ngIf="passwordMessage">
+          <i class="fas fa-check-circle"></i>
+          {{ passwordMessage }}
+        </div>
+      </div>
+
       <!-- Status message when connected -->
-      <div *ngIf="driveStatus?.connected" class="status-msg">
+      <div *ngIf="driveStatus?.connected && passwordUnlocked" class="status-msg">
         <i class="fas fa-shield-alt"></i> Data encrypted with AES-256. Auto-sync
         active.
       </div>
+      <div
+        *ngIf="driveStatus?.connected && !passwordUnlocked"
+        class="status-msg"
+      >
+        <i class="fas fa-shield-alt"></i> Configure or unlock the sync password
+        to start encrypted sync.
+      </div>
 
       <!-- Version History (Time Machine) -->
-      <div class="version-section" *ngIf="driveStatus?.connected">
+      <div
+        class="version-section"
+        *ngIf="driveStatus?.connected && passwordUnlocked"
+      >
         <h4 (click)="toggleVersions()" class="section-header">
           <i
             class="fas"
@@ -458,6 +577,17 @@ export class SettingsComponent implements OnInit, OnDestroy {
   driveStatus: DriveConnectionStatus | null = null;
   syncState: SyncState | null = null;
   isConnecting = false;
+  isSavingPassword = false;
+  isSyncingNow = false;
+
+  // Password
+  passwordInput = '';
+  passwordConfirm = '';
+  passwordConfigured = false;
+  passwordUnlocked = false;
+  passwordError: string | null = null;
+  passwordMessage: string | null = null;
+  isChangingPassword = false;
 
   // Version History
   versions: SyncVersion[] = [];
@@ -472,15 +602,25 @@ export class SettingsComponent implements OnInit, OnDestroy {
     return this.sync.missingPlugins$;
   }
 
+  get needsPasswordConfirmation(): boolean {
+    return !this.passwordConfigured || this.isChangingPassword;
+  }
+
+  get passwordActionLabel(): string {
+    if (this.isChangingPassword) {
+      return 'Save New Password';
+    }
+    return this.passwordConfigured ? 'Unlock Sync' : 'Save Password';
+  }
+
   ngOnInit(): void {
+    this.refreshPasswordState();
+
     // Subscribe to drive status
     this.subscriptions.push(
       this.sync.getDriveStatus().subscribe((status) => {
         this.driveStatus = status;
-        if (status.connected) {
-          // If connected, ensure security is ready
-          this.sync.useDefaultPassword();
-        }
+        this.refreshPasswordState();
       }),
     );
 
@@ -502,10 +642,11 @@ export class SettingsComponent implements OnInit, OnDestroy {
       const success = await this.sync.connectGoogleDrive();
       if (success) {
         await this.sync.setEnabled(true);
-        // Using default password automatically
-        await this.sync.useDefaultPassword();
-        // Trigger initial sync
-        this.sync.fullSync();
+        if (this.passwordUnlocked) {
+          await this.syncNow();
+        } else {
+          this.passwordMessage = 'Set or unlock the sync password to continue.';
+        }
       }
     } finally {
       this.isConnecting = false;
@@ -515,6 +656,112 @@ export class SettingsComponent implements OnInit, OnDestroy {
   async disconnectGoogleDrive(): Promise<void> {
     await this.sync.disconnectGoogleDrive();
     await this.sync.setEnabled(false);
+    this.refreshPasswordState();
+  }
+
+  async saveOrUnlockPassword(): Promise<void> {
+    this.passwordError = null;
+    this.passwordMessage = null;
+
+    if (!this.passwordInput) {
+      this.passwordError = 'Password is required.';
+      return;
+    }
+
+    if (this.needsPasswordConfirmation) {
+      if (this.passwordInput.length < 8) {
+        this.passwordError = 'Use at least 8 characters.';
+        return;
+      }
+      if (this.passwordInput !== this.passwordConfirm) {
+        this.passwordError = 'Passwords do not match.';
+        return;
+      }
+    }
+
+    this.isSavingPassword = true;
+    try {
+      if (this.isChangingPassword) {
+        const result = await this.sync.changeMasterPassword(this.passwordInput);
+        if (result && !result.success) {
+          this.passwordError = result.error || 'Failed to change password.';
+          return;
+        }
+        this.passwordMessage = 'Password changed and remote file re-encrypted.';
+        this.isChangingPassword = false;
+      } else if (this.passwordConfigured) {
+        const success = this.sync.setMasterPassword(this.passwordInput);
+        if (!success) {
+          this.passwordError = 'Incorrect master password.';
+          return;
+        }
+        this.passwordMessage = 'Sync unlocked.';
+        await this.syncNow();
+      } else {
+        const result = await this.sync.configureMasterPassword(
+          this.passwordInput,
+        );
+        if (result && !result.success) {
+          this.passwordError = result.error || 'Failed to configure password.';
+          return;
+        }
+        this.passwordMessage = 'Password configured.';
+      }
+
+      this.resetPasswordInputs();
+      this.refreshPasswordState();
+    } finally {
+      this.isSavingPassword = false;
+    }
+  }
+
+  async syncNow(): Promise<void> {
+    this.passwordError = null;
+    this.isSyncingNow = true;
+    try {
+      const result = await this.sync.fullSync();
+      if (!result.success) {
+        this.passwordError = result.error || 'Sync failed.';
+      }
+    } finally {
+      this.isSyncingNow = false;
+      this.refreshPasswordState();
+    }
+  }
+
+  lockPassword(): void {
+    this.sync.clearPassword();
+    this.resetPasswordInputs();
+    this.passwordMessage = 'Sync locked.';
+    this.refreshPasswordState();
+  }
+
+  beginPasswordChange(): void {
+    if (!this.passwordUnlocked) {
+      this.passwordError = 'Unlock sync before changing the password.';
+      return;
+    }
+
+    this.resetPasswordInputs();
+    this.passwordError = null;
+    this.passwordMessage = null;
+    this.isChangingPassword = true;
+  }
+
+  cancelPasswordChange(): void {
+    this.isChangingPassword = false;
+    this.resetPasswordInputs();
+    this.passwordError = null;
+  }
+
+  private refreshPasswordState(): void {
+    this.passwordConfigured = this.sync.isPasswordConfigured();
+    this.passwordUnlocked = this.sync.hasPassword();
+  }
+
+  private resetPasswordInputs(): void {
+    this.passwordInput = '';
+    this.passwordConfirm = '';
   }
 
   formatTime(date: Date): string {

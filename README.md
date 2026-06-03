@@ -88,7 +88,8 @@ Fully supports syncing snippets/commands created with the popular `quick-cmds` p
 1. Open **Tabby** -> **Settings** -> **Google Drive Sync**
 2. Click **"Connect Google Drive"**
 3. Sign in with your Google account
-4. Done! Your settings will now sync automatically.
+4. Create a **Sync Password** when prompted. Use the same password on every machine.
+5. After the password is unlocked, sync starts automatically. You can also click **Sync Now**.
 
 ## ⚠️ Security & Privacy
 
@@ -97,6 +98,7 @@ Fully supports syncing snippets/commands created with the popular `quick-cmds` p
 - All sync data is encrypted with **AES-256-GCM**
 - Encryption uses **PBKDF2** for key derivation
 - Each encryption uses unique IV and salt
+- The sync password is required before upload/download and is never stored in plaintext
 - Data is stored in Google Drive's **AppData folder**, which is hidden from normal view and only accessible by this plugin.
 
 ### Privacy Guarantees
